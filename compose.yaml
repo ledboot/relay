@@ -1,0 +1,28 @@
+services:
+  relay-api:
+    container_name: relay-api
+    build: ./backend
+    env_file: .env
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      DATABASE_PATH: /data/sms.db
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - sms-data:/data
+    restart: unless-stopped
+  relay-web:
+    container_name: relay-web
+    build: ./web
+    environment:
+      ADMIN_PATH: ${ADMIN_PATH:-/console}
+      API_INTERNAL_URL: http://relay-api:8080
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3000}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - relay-api
+    restart: unless-stopped
+volumes:
+  sms-data:

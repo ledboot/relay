@@ -1,0 +1,2 @@
+Tool: built-in image_gen; transparent_background=true.
+Edit the previous generated relay logo. Remove the entire wordmark 'relay.' including the green period. Preserve only the existing green message-bubble and signal-arcs symbol on the left, retaining its exact design, proportions, rounded geometry and green color. Center that single icon on a square transparent canvas, with balanced compact padding approximately 12% on each side. No letters, no words, no punctuation, no additional symbols, no background, no shadow. Clean crisp logo edges. Actual transparent background.

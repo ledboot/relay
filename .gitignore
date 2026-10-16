@@ -1,0 +1,42 @@
+# ── 敏感配置：绝不入库 ────────────────────────────────────────────────
+# .env 保存 ADMIN_TOKEN、TextVerified API Key 和 webhook secret；
+# 只提交占位模板 .env.example，不要在这里写真实值。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── 本地数据：含真实 CD Key、接收号码与验证码 ─────────────────────────
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+data/
+output/keys/
+
+# ── Go 构建与测试产物 ────────────────────────────────────────────────
+backend/server
+backend/sms-verified
+*.test
+*.out
+coverage.*
+
+# ── Node / Next.js ──────────────────────────────────────────────────
+node_modules/
+.next/
+.next-dev/
+out/
+build/
+*.tsbuildinfo
+
+# ── 打包导出的可再生产物（品牌源图保留） ─────────────────────────────
+output/**/*.zip
+
+# ── 操作系统与编辑器 ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
