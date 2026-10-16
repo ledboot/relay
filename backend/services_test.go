@@ -21,7 +21,7 @@ func TestServiceCapabilityNormalization(t *testing.T) {
 	}))
 	defer s.Close()
 	p := &TV{Base: s.URL, Client: s.Client()}
-	services, err := p.Services(context.Background())
+	services, err := p.Services(context.Background(), TypeVerification)
 	if err != nil || len(services) != 3 {
 		t.Fatalf("services: %v, %v", services, err)
 	}
@@ -35,7 +35,7 @@ type capabilityProvider struct {
 	capability string
 }
 
-func (p capabilityProvider) Services(context.Context) ([]Service, error) {
+func (p capabilityProvider) Services(context.Context, string) ([]Service, error) {
 	return []Service{{Name: "openai", Capability: p.capability}}, nil
 }
 

@@ -14,8 +14,12 @@ type stateProvider struct {
 	err   error
 }
 
-func (p *stateProvider) Get(context.Context, string) (Verification, []SMS, error) {
-	return Verification{ID: "v1", Number: "15555550100", State: p.state}, p.sms, p.err
+func (p *stateProvider) Get(_ context.Context, reservationType, id string) (Reservation, []SMS, error) {
+	// stateProvider drives verification states; rentals are not part of these cases.
+	if isRental(reservationType) {
+		return Reservation{ID: id}, nil, p.err
+	}
+	return Reservation{ID: "v1", Number: "15555550100", State: p.state}, p.sms, p.err
 }
 func TestOrderEndStates(t *testing.T) {
 	for upstream, want := range map[string]string{"verificationTimedOut": "timed_out", "verificationCanceled": "canceled", "verificationRefunded": "refunded", "verificationReported": "reported"} {
@@ -23,7 +27,7 @@ func TestOrderEndStates(t *testing.T) {
 			t.Run(upstream+initial, func(t *testing.T) {
 				a, f, key := fixture(t)
 				a.provider = &stateProvider{fakeProvider: f, state: upstream}
-				_, err := a.db.Exec("UPDATE keys SET state=?,verification_id='v1'", initial)
+				_, err := a.db.Exec("UPDATE keys SET state=?,reservation_id='v1'", initial)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -46,7 +50,7 @@ func TestSMSWinsOverTimeout(t *testing.T) {
 	a, f, key := fixture(t)
 	a.provider = &stateProvider{fakeProvider: f, state: "verificationTimedOut"}
 	f.sms = []SMS{{Code: "123456", Content: "code 123456"}}
-	a.db.Exec("UPDATE keys SET state='waiting',verification_id='v1'")
+	a.db.Exec("UPDATE keys SET state='waiting',reservation_id='v1'")
 	w := call(a, "/api/status", key)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"used"`) {
 		t.Fatal(w.Body.String())
@@ -56,7 +60,7 @@ func TestSMSWinsOverTimeout(t *testing.T) {
 func TestQueryFailureDoesNotMeanTimeout(t *testing.T) {
 	a, f, key := fixture(t)
 	a.provider = &stateProvider{fakeProvider: f, err: errors.New("network timeout")}
-	a.db.Exec("UPDATE keys SET state='waiting',verification_id='v1'")
+	a.db.Exec("UPDATE keys SET state='waiting',reservation_id='v1'")
 	if w := call(a, "/api/status", key); w.Code != 502 {
 		t.Fatal(w.Code)
 	}

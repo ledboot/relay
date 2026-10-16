@@ -47,11 +47,11 @@ func TestTimedOutKeyRetriesWithNewPurchase(t *testing.T) {
 	}
 	var id string
 	var retries int
-	if e := a.db.QueryRow("SELECT verification_id,retries FROM keys").Scan(&id, &retries); e != nil {
+	if e := a.db.QueryRow("SELECT reservation_id,retries FROM keys").Scan(&id, &retries); e != nil {
 		t.Fatal(e)
 	}
 	if id != "v2" || retries != 1 {
-		t.Fatalf("verification_id=%q retries=%d，期望 v2 / 1", id, retries)
+		t.Fatalf("reservation_id=%q retries=%d，期望 v2 / 1", id, retries)
 	}
 }
 
@@ -112,7 +112,7 @@ func TestConcurrentRetryBuysOnce(t *testing.T) {
 func TestRetryDisabledWhenMaxRetriesIsZero(t *testing.T) {
 	a, f, key := fixture(t)
 	a.maxRetries = 0
-	a.db.Exec("UPDATE keys SET state='timed_out',verification_id='v1'")
+	a.db.Exec("UPDATE keys SET state='timed_out',reservation_id='v1'")
 	if w := call(a, "/api/redeem", key); w.Code != 409 {
 		t.Fatalf("MAX_RETRIES=0 应保持人工处理流程：%d %s", w.Code, w.Body.String())
 	}

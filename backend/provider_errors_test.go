@@ -20,7 +20,7 @@ func TestPurchaseRejection(t *testing.T) {
 			}))
 			defer server.Close()
 			p := &TV{Base: server.URL, Client: server.Client(), token: "test", expiry: time.Now().Add(time.Hour), MaxPrice: 5}
-			_, err := p.Create(context.Background(), "openai", "stable")
+			_, err := p.Create(context.Background(), PurchaseRequest{Service: "openai", Type: TypeVerification}, "stable")
 			upstream, ok := err.(*UpstreamError)
 			if !ok || upstream.Status != 400 {
 				t.Fatalf("unexpected error: %v", err)
@@ -40,7 +40,7 @@ func TestPurchaseRejection(t *testing.T) {
 				}
 			}
 			var state, id string
-			if err := a.db.QueryRow("SELECT state,verification_id FROM keys WHERE hash=?", digest(key)).Scan(&state, &id); err != nil {
+			if err := a.db.QueryRow("SELECT state,reservation_id FROM keys WHERE hash=?", digest(key)).Scan(&state, &id); err != nil {
 				t.Fatal(err)
 			}
 			if state != "allocating" || id != "" {

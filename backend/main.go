@@ -12,12 +12,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +35,7 @@ type App struct {
 	provider       Provider
 	admin, secret  string
 	maxRetries     int
+	maxRentalPrice float64
 	limitPerMin    int
 	keyLimitPerMin int
 	limiter        *limiter
@@ -130,27 +133,44 @@ func requestKey(r *http.Request) string {
 	}
 	return strings.TrimSpace(b.Key)
 }
+
 type Key struct {
-	ID             int64  `json:"id"`
-	Hint           string `json:"hint"`
-	Service        string `json:"service"`
-	State          string `json:"state"`
-	VerificationID string `json:"-"`
-	Phone          string `json:"phone"`
-	Code           string `json:"code"`
-	Message        string `json:"message"`
-	EndsAt         string `json:"endsAt"`
-	CreatedAt      string `json:"createdAt"`
+	ID        int64  `json:"id"`
+	Hint      string `json:"hint"`
+	Service   string `json:"service"`
+	State     string `json:"state"`
+	Phone     string `json:"phone"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	EndsAt    string `json:"endsAt"`
+	CreatedAt string `json:"createdAt"`
+	// ReservationType decides both the upstream purchase flow and the state machine.
+	// Duration is the rental period and stays empty for verifications.
+	ReservationType string `json:"reservationType"`
+	Duration        string `json:"duration"`
+	// ReservationID is the upstream verification or rental ID. Internal only: the
+	// public API never exposes it, and webhooks match on it.
+	ReservationID string `json:"-"`
 	// Retries counts completed retry purchases. Internal only: it decides the
 	// idempotency key, callers get the outcome through state and error codes.
 	Retries int `json:"-"`
+	// Messages lists every SMS a rental has received, newest first. Verifications keep a
+	// single code in the key row instead, so the field stays empty for them.
+	Messages []Message `json:"messages,omitempty"`
 }
 
-const columns = "id,hint,service,state,verification_id,phone,code,message,ends_at,created_at,retries"
+// Message is one SMS received on a rental number.
+type Message struct {
+	Code    string `json:"code"`
+	Content string `json:"content"`
+	At      string `json:"at"`
+}
+
+const columns = "id,hint,service,reservation_type,duration,state,reservation_id,phone,code,message,ends_at,created_at,retries"
 
 func scan(s interface{ Scan(...any) error }) (Key, error) {
 	var k Key
-	e := s.Scan(&k.ID, &k.Hint, &k.Service, &k.State, &k.VerificationID, &k.Phone, &k.Code, &k.Message, &k.EndsAt, &k.CreatedAt, &k.Retries)
+	e := s.Scan(&k.ID, &k.Hint, &k.Service, &k.ReservationType, &k.Duration, &k.State, &k.ReservationID, &k.Phone, &k.Code, &k.Message, &k.EndsAt, &k.CreatedAt, &k.Retries)
 	return k, e
 }
 
@@ -209,36 +229,70 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	_, e = db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
- CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,hash TEXT NOT NULL UNIQUE,hint TEXT NOT NULL,service TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'ready',verification_id TEXT NOT NULL DEFAULT '',phone TEXT NOT NULL DEFAULT '',code TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',ends_at TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
- CREATE UNIQUE INDEX IF NOT EXISTS verification_unique ON keys(verification_id) WHERE verification_id<>'';
+ CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,hash TEXT NOT NULL UNIQUE,hint TEXT NOT NULL,service TEXT NOT NULL,reservation_type TEXT NOT NULL DEFAULT 'verification',duration TEXT NOT NULL DEFAULT '',state TEXT NOT NULL DEFAULT 'ready',reservation_id TEXT NOT NULL DEFAULT '',phone TEXT NOT NULL DEFAULT '',code TEXT NOT NULL DEFAULT '',message TEXT NOT NULL DEFAULT '',ends_at TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
  CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`)
 	if e != nil {
 		db.Close()
 		return nil, e
 	}
-	var hasFullKey int
-	if e = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('keys') WHERE name='full_key'").Scan(&hasFullKey); e != nil {
+	if e = migrate(db); e != nil {
 		db.Close()
 		return nil, e
-	}
-	if hasFullKey == 0 {
-		if _, e = db.Exec("ALTER TABLE keys ADD COLUMN full_key TEXT NOT NULL DEFAULT ''"); e != nil {
-			db.Close()
-			return nil, e
-		}
-	}
-	var hasRetries int
-	if e = db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('keys') WHERE name='retries'").Scan(&hasRetries); e != nil {
-		db.Close()
-		return nil, e
-	}
-	if hasRetries == 0 {
-		if _, e = db.Exec("ALTER TABLE keys ADD COLUMN retries INTEGER NOT NULL DEFAULT 0"); e != nil {
-			db.Close()
-			return nil, e
-		}
 	}
 	return db, nil
+}
+
+// migrate upgrades an existing database in place. The service is not live yet, but a
+// developer's local sms.db must survive: verification_id became reservation_id once the
+// same column started holding rental IDs, which share one upstream ID space.
+func migrate(db *sql.DB) error {
+	legacy, err := hasColumn(db, "verification_id")
+	if err != nil {
+		return err
+	}
+	renamed, err := hasColumn(db, "reservation_id")
+	if err != nil {
+		return err
+	}
+	if legacy && !renamed {
+		if _, err = db.Exec("ALTER TABLE keys RENAME COLUMN verification_id TO reservation_id"); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct{ name, ddl string }{
+		{"reservation_type", "TEXT NOT NULL DEFAULT 'verification'"},
+		{"duration", "TEXT NOT NULL DEFAULT ''"},
+		{"full_key", "TEXT NOT NULL DEFAULT ''"},
+		{"retries", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		ok, err := hasColumn(db, c.name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if _, err = db.Exec("ALTER TABLE keys ADD COLUMN " + c.name + " " + c.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	// Reservation codes are never persisted: rental messages are read live from upstream.
+	// A table left over from the earlier design is dropped here so no code stays on disk.
+	if _, err = db.Exec("DROP TABLE IF EXISTS messages"); err != nil {
+		return err
+	}
+	// Rebuild the partial unique index last so it always covers the current column name,
+	// including when the rename above ran on a legacy database.
+	if _, err = db.Exec("DROP INDEX IF EXISTS verification_unique"); err != nil {
+		return err
+	}
+	_, err = db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS reservation_unique ON keys(reservation_id) WHERE reservation_id<>''")
+	return err
+}
+
+func hasColumn(db *sql.DB, name string) (bool, error) {
+	var n int
+	e := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('keys') WHERE name=?", name).Scan(&n)
+	return n > 0, e
 }
 func reply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -303,7 +357,15 @@ func (a *App) adminAuth() gin.HandlerFunc {
 func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == "GET" && r.URL.Path == "/api/admin/services":
-		s, e := a.provider.Services(r.Context())
+		kind := strings.TrimSpace(r.URL.Query().Get("type"))
+		if kind == "" {
+			kind = TypeVerification
+		}
+		if !purchasableType(kind) {
+			fail(w, 400, "类型无效")
+			return
+		}
+		s, e := a.provider.Services(r.Context(), kind)
 		if e != nil {
 			fail(w, 502, "无法读取上游平台列表，请检查 API 配置")
 			return
@@ -315,10 +377,27 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		var b struct {
 			Service     string
 			BrandPrefix string `json:"brandPrefix"`
+			Type        string `json:"type"`
+			Duration    string `json:"duration"`
 			Count       int
 		}
 		if !decode(w, r, &b) {
 			return
+		}
+		if b.Type = strings.TrimSpace(b.Type); b.Type == "" {
+			b.Type = TypeVerification
+		}
+		if !purchasableType(b.Type) {
+			fail(w, 400, "该类型的 CD Key 暂未开放")
+			return
+		}
+		if isRental(b.Type) {
+			if !rentalDurations[b.Duration] {
+				fail(w, 400, "请选择有效的租用时长")
+				return
+			}
+		} else {
+			b.Duration = ""
 		}
 		b.BrandPrefix = strings.ToUpper(strings.TrimSpace(b.BrandPrefix))
 		if b.BrandPrefix == "" {
@@ -332,7 +411,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "每次生成 1–100 个")
 			return
 		}
-		services, e := a.provider.Services(r.Context())
+		services, e := a.provider.Services(r.Context(), b.Type)
 		if e != nil {
 			fail(w, 502, "无法验证上游平台")
 			return
@@ -356,7 +435,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		keys := []string{}
 		for i := 0; i < b.Count; i++ {
 			key := randomKey(b.BrandPrefix, b.Service)
-			_, e = tx.Exec("INSERT INTO keys(hash,hint,service,full_key) VALUES(?,?,?,?)", digest(key), b.BrandPrefix+"-"+servicePrefix(b.Service)+"-…"+key[len(key)-6:], b.Service, key)
+			_, e = tx.Exec("INSERT INTO keys(hash,hint,service,reservation_type,duration,full_key) VALUES(?,?,?,?,?,?)", digest(key), b.BrandPrefix+"-"+servicePrefix(b.Service)+"-…"+key[len(key)-6:], b.Service, b.Type, b.Duration, key)
 			if e != nil {
 				fail(w, 500, "生成失败")
 				return
@@ -411,6 +490,12 @@ func (a *App) redeem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if k.State == "ready" {
+		// A rental purchase carries no upstream maxPrice, so the configured cap is enforced
+		// here, once, before any spend. The key stays ready when the price is out of range,
+		// so nothing is bought until the cap is raised.
+		if isRental(k.ReservationType) && !a.checkRentalPrice(w, r.Context(), k) {
+			return
+		}
 		_, e := a.db.Exec("UPDATE keys SET state='allocating' WHERE id=? AND state='ready'", k.ID)
 		if e != nil {
 			fail(w, 500, "兑换失败")
@@ -453,13 +538,20 @@ func (a *App) redeem(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if k.State == "allocating" { // Stable purchase key survives retries, concurrent requests and process restarts.
-		v, e := a.provider.Create(r.Context(), k.Service, purchaseKey(hash, k.Retries))
+		req := PurchaseRequest{Service: k.Service, Type: k.ReservationType, Duration: k.Duration}
+		v, e := a.provider.Create(r.Context(), req, purchaseKey(hash, k.Retries))
 		if e != nil {
-			slog.WarnContext(r.Context(), "purchase pending", "service", k.Service, "key_id", k.ID, "request_id", cRequestID(r), "error", e.Error())
-			fail(w, 502, "号码申请暂未完成，请稍后重新兑换")
+			slog.WarnContext(r.Context(), "purchase pending", "service", k.Service, "type", k.ReservationType, "key_id", k.ID, "request_id", cRequestID(r), "error", e.Error())
+			status, message := purchaseFailure(e)
+			fail(w, status, message)
 			return
 		}
-		_, e = a.db.Exec("UPDATE keys SET verification_id=?,state='waiting' WHERE id=? AND state='allocating'", v.ID, k.ID)
+		// A rental is usable as soon as it is bought; a verification first waits for an SMS.
+		next := "waiting"
+		if isRental(k.ReservationType) {
+			next = "rental_active"
+		}
+		_, e = a.db.Exec("UPDATE keys SET reservation_id=?,state=? WHERE id=? AND state='allocating'", v.ID, next, k.ID)
 		if e != nil {
 			fail(w, 500, "保存订单失败，请重新兑换")
 			return
@@ -472,6 +564,41 @@ func (a *App) redeem(w http.ResponseWriter, r *http.Request) {
 	}
 	reply(w, 200, k)
 }
+
+// checkRentalPrice applies the rental cap before the first purchase attempt. Upstream has
+// no maxPrice on a rental, so this lookup is the only guard: a failed lookup blocks the
+// purchase rather than risking an unbounded charge. It runs only on the ready -> allocating
+// transition, so resuming an interrupted purchase is never blocked by a price change.
+func (a *App) checkRentalPrice(w http.ResponseWriter, ctx context.Context, k Key) bool {
+	price, e := a.provider.PriceRental(ctx, k.Service, k.Duration)
+	if e != nil {
+		slog.WarnContext(ctx, "rental price check failed", "service", k.Service, "duration", k.Duration, "key_id", k.ID, "error", e.Error())
+		fail(w, 502, "无法确认租用价格，请稍后重试")
+		return false
+	}
+	if price > a.maxRentalPrice {
+		fail(w, 409, fmt.Sprintf("当前租用价格 %.2f 超过上限 %.2f，请联系管理员处理", price, a.maxRentalPrice))
+		return false
+	}
+	return true
+}
+
+// purchaseFailure classifies a rejected purchase. A 4xx answer is a decision (price cap,
+// no inventory, unknown service), not a hiccup: replaying the same request cannot succeed,
+// so it is reported for manual handling instead of as a transient error. 409 still means
+// the idempotent purchase is running and 429 is throttling, so both stay retryable.
+func purchaseFailure(e error) (int, string) {
+	var upstream *UpstreamError
+	if errors.As(e, &upstream) && (upstream.Status == 400 || upstream.Status == 403 || upstream.Status == 404) {
+		code := upstream.Code
+		if code == "" {
+			code = strconv.Itoa(upstream.Status)
+		}
+		return 502, "上游拒绝本次号码申请（" + code + "），请联系管理员处理"
+	}
+	return 502, "号码申请暂未完成，请稍后重新兑换"
+}
+
 func (a *App) status(w http.ResponseWriter, r *http.Request) {
 	k, _, ok := a.readKey(w, r)
 	if !ok {
@@ -486,14 +613,42 @@ func (a *App) status(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) refresh(ctx context.Context, id int64) (Key, error) {
 	k, e := scan(a.db.QueryRow("SELECT "+columns+" FROM keys WHERE id=?", id))
-	if e != nil || (k.State != "waiting" && k.State != "expired" && !(k.State == "used" && k.Phone == "")) {
-		return k, e
-	}
-	v, msgs, e := a.provider.Get(ctx, k.VerificationID)
 	if e != nil {
 		return k, e
 	}
-	_, e = a.db.Exec("UPDATE keys SET phone=?,ends_at=? WHERE id=?", v.Number, v.EndsAt, id)
+	if isRental(k.ReservationType) && k.ReservationID != "" {
+		if !refreshable(k) {
+			// Message contents are not stored, so even a finished rental is read from
+			// upstream: re-entering the key still shows what it received.
+			return a.rentalSnapshot(ctx, k)
+		}
+		return a.refreshRental(ctx, k)
+	}
+	if !refreshable(k) {
+		return k, nil
+	}
+	return a.refreshVerification(ctx, k)
+}
+
+// refreshable reports whether a stored state can still change upstream. Terminal states
+// (used, disabled, refunded, reported, ...) are returned to the caller untouched.
+func refreshable(k Key) bool {
+	switch k.State {
+	case "waiting", "expired", "rental_active":
+		return true
+	case "used":
+		// Rows written by an early webhook are marked used before the number is stored.
+		return k.Phone == ""
+	}
+	return false
+}
+
+func (a *App) refreshVerification(ctx context.Context, k Key) (Key, error) {
+	v, msgs, e := a.provider.Get(ctx, k.ReservationType, k.ReservationID)
+	if e != nil {
+		return k, e
+	}
+	_, e = a.db.Exec("UPDATE keys SET phone=?,ends_at=? WHERE id=?", v.Number, v.EndsAt, k.ID)
 	if e != nil {
 		return k, e
 	}
@@ -519,12 +674,126 @@ func (a *App) refresh(ctx context.Context, id int64) (Key, error) {
 			state = "reported"
 		}
 	}
-	_, e = a.db.Exec("UPDATE keys SET phone=?,ends_at=?,state=?,code=?,message=? WHERE id=? AND state IN ('waiting','expired')", v.Number, v.EndsAt, state, code, message, id)
+	_, e = a.db.Exec("UPDATE keys SET phone=?,ends_at=?,state=?,code=?,message=? WHERE id=? AND state IN ('waiting','expired')", v.Number, v.EndsAt, state, code, message, k.ID)
 	if e != nil {
 		return k, e
 	}
-	return scan(a.db.QueryRow("SELECT "+columns+" FROM keys WHERE id=?", id))
+	return scan(a.db.QueryRow("SELECT "+columns+" FROM keys WHERE id=?", k.ID))
 }
+
+// refreshRental persists the parts of a rental that are safe to store - number, end time
+// and state - and returns one response carrying the live message list.
+//
+// Expiry is a normal end of life, not an error, so it needs no operator action.
+func (a *App) refreshRental(ctx context.Context, k Key) (Key, error) {
+	k, e := a.rentalSnapshot(ctx, k)
+	if e != nil {
+		return k, e
+	}
+	_, e = a.db.Exec("UPDATE keys SET phone=?,ends_at=?,state=? WHERE id=? AND state='rental_active'", k.Phone, k.EndsAt, k.State, k.ID)
+	if e != nil {
+		return k, e
+	}
+	stored, e := scan(a.db.QueryRow("SELECT "+columns+" FROM keys WHERE id=?", k.ID))
+	if e != nil {
+		return k, e
+	}
+	stored.Messages = k.Messages
+	return stored, nil
+}
+
+// rentalSnapshot fetches a rental and the messages currently visible on it. Nothing about a
+// message is written anywhere: the list is rebuilt on every request, so no verification code
+// is ever stored.
+func (a *App) rentalSnapshot(ctx context.Context, k Key) (Key, error) {
+	v, msgs, e := a.provider.Get(ctx, k.ReservationType, k.ReservationID)
+	if e != nil {
+		return k, e
+	}
+	k.Phone, k.EndsAt = v.Number, v.EndsAt
+	k.Messages = recentMessages(msgs, v.CreatedAt)
+	switch v.State {
+	case "nonrenewableExpired", "renewableExpired":
+		k.State = "rental_expired"
+	case "nonrenewableRefunded", "renewableRefunded":
+		k.State = "rental_refunded"
+	}
+	return k, nil
+}
+
+// maxRentalMessages caps one rental response. The upstream list is already the latest batch;
+// this keeps the payload small on a number that has been rented for a long time.
+const maxRentalMessages = 20
+
+// utcStamp normalises an upstream timestamp so every response carries one consistent format,
+// whatever offset the source used.
+func utcStamp(value string) string {
+	t, e := time.Parse(time.RFC3339Nano, value)
+	if e != nil {
+		return value
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+// recentMessages turns the upstream list into the response list: only what arrived after the
+// rental itself was created (never the number's earlier life), newest first, capped. It
+// writes nothing, so polling cannot accumulate or duplicate anything.
+func recentMessages(msgs []SMS, since string) []Message {
+	cutoff, _ := time.Parse(time.RFC3339Nano, since)
+	type entry struct {
+		at time.Time
+		m  Message
+	}
+	kept := []entry{}
+	for _, m := range msgs {
+		if m.Code == "" && m.Content == "" {
+			continue
+		}
+		at, e := time.Parse(time.RFC3339Nano, m.CreatedAt)
+		if e != nil {
+			at = time.Time{}
+		} else if !cutoff.IsZero() && at.Before(cutoff) {
+			continue
+		}
+		kept = append(kept, entry{at: at, m: Message{Code: m.Code, Content: m.Content, At: utcStamp(m.CreatedAt)}})
+	}
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].at.After(kept[j].at) })
+	if len(kept) > maxRentalMessages {
+		kept = kept[:maxRentalMessages]
+	}
+	out := make([]Message, 0, len(kept))
+	for _, e := range kept {
+		out = append(out, e.m)
+	}
+	return out
+}
+
+// syncOrders refreshes every stored order matching filter, one at a time, so a slow or
+// failing upstream cannot stack requests. filter is one of this service's own constants,
+// never caller input.
+func (a *App) syncOrders(ctx context.Context, filter string) {
+	rows, e := a.db.Query("SELECT id FROM keys WHERE " + filter + " AND reservation_id<>'' ORDER BY id")
+	if e != nil {
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, e := a.refresh(ctx, id); e != nil {
+			slog.ErrorContext(ctx, "order sync failed", "key_id", id, "error_type", errorType(e))
+		}
+	}
+}
+
 func (a *App) webhook(w http.ResponseWriter, r *http.Request) {
 	if a.secret == "" {
 		fail(w, 503, "Webhook 未配置")
@@ -579,11 +848,13 @@ func (a *App) webhook(w http.ResponseWriter, r *http.Request) {
 	n, _ := res.RowsAffected()
 	if n > 0 {
 		var id int64
-		e = tx.QueryRow("SELECT id FROM keys WHERE verification_id=?", event.Data.ReservationID).Scan(&id)
+		e = tx.QueryRow("SELECT id FROM keys WHERE reservation_id=?", event.Data.ReservationID).Scan(&id)
 		if e != nil {
 			fail(w, 503, "订单尚未同步，请重试")
 			return
 		}
+		// Only a verification is consumed by a message. A rental's messages are read live
+		// from upstream and never stored, so its callbacks are deduplicated and ignored.
 		if event.Data.Code != "" || event.Data.Content != "" {
 			_, e = tx.Exec("UPDATE keys SET state='used',code=?,message=? WHERE id=? AND state IN ('waiting','expired','timed_out','canceled','refunded','reported')", event.Data.Code, event.Data.Content, id)
 			if e != nil {
@@ -626,6 +897,13 @@ func main() {
 		slog.Error("invalid max price")
 		os.Exit(1)
 	}
+	// Rental purchases cannot carry an upstream maxPrice, so this cap is checked against
+	// the rental pricing endpoint before every first purchase attempt.
+	rentalPrice, e := strconv.ParseFloat(env("TEXTVERIFIED_MAX_RENTAL_PRICE", "30"), 64)
+	if e != nil || rentalPrice <= 0 {
+		slog.Error("invalid max rental price")
+		os.Exit(1)
+	}
 	// Extra paid purchases allowed for one CD Key whose number timed out. 0 disables retry.
 	maxRetries, e := strconv.Atoi(env("MAX_RETRIES", "1"))
 	if e != nil || maxRetries < 0 {
@@ -647,37 +925,27 @@ func main() {
 	}
 	base := strings.TrimRight(env("TEXTVERIFIED_BASE_URL", "https://www.textverified.com"), "/")
 	client := &http.Client{Timeout: 25 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	a := &App{db: db, provider: &TV{Base: base, Key: os.Getenv("TEXTVERIFIED_API_KEY"), Username: os.Getenv("TEXTVERIFIED_API_USERNAME"), MaxPrice: price, Client: client}, admin: admin, secret: os.Getenv("TEXTVERIFIED_WEBHOOK_SECRET"), maxRetries: maxRetries, limitPerMin: limitPerMin, keyLimitPerMin: keyLimitPerMin, limiter: newLimiter(maxIdentities)}
+	a := &App{db: db, provider: &TV{Base: base, Key: os.Getenv("TEXTVERIFIED_API_KEY"), Username: os.Getenv("TEXTVERIFIED_API_USERNAME"), MaxPrice: price, Client: client}, admin: admin, secret: os.Getenv("TEXTVERIFIED_WEBHOOK_SECRET"), maxRetries: maxRetries, maxRentalPrice: rentalPrice, limitPerMin: limitPerMin, keyLimitPerMin: keyLimitPerMin, limiter: newLimiter(maxIdentities)}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
+		// Verifications are swept fast because the customer is waiting for a code that can
+		// arrive at any moment even after the page is closed.
+		fast := time.NewTicker(15 * time.Second)
+		// Rentals are swept slowly: their only transition is expiry, and polling every
+		// active rental every 15 seconds would multiply upstream calls for numbers nobody
+		// is waiting on. A customer polling /api/status still gets a fresh state at once.
+		slow := time.NewTicker(5 * time.Minute)
+		defer fast.Stop()
+		defer slow.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				rows, e := db.Query("SELECT id FROM keys WHERE state IN ('waiting','expired') AND verification_id<>'' ORDER BY id")
-				if e != nil {
-					continue
-				}
-				ids := []int64{}
-				for rows.Next() {
-					var id int64
-					if rows.Scan(&id) == nil {
-						ids = append(ids, id)
-					}
-				}
-				rows.Close()
-				for _, id := range ids {
-					if ctx.Err() != nil {
-						return
-					}
-					if _, e := a.refresh(ctx, id); e != nil {
-						slog.ErrorContext(ctx, "order sync failed", "key_id", id, "error_type", errorType(e))
-					}
-				}
+			case <-fast.C:
+				a.syncOrders(ctx, "state IN ('waiting','expired')")
+			case <-slow.C:
+				a.syncOrders(ctx, "state='rental_active'")
 			}
 		}
 	}()

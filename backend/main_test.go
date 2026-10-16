@@ -15,30 +15,60 @@ import (
 	"testing"
 )
 
+// fakeRentalCreated is the moment the fake rental was bought; messages before it must not
+// reach the customer.
+const fakeRentalCreated = "2026-10-16T09:00:00Z"
+
 type fakeProvider struct {
 	mu        sync.Mutex
 	purchases map[string]string
 	sms       []SMS
 	fail      bool
+	// rentalSMS is what Get reports for rentals; rentals keep every message.
+	rentalSMS []SMS
+	// rentalState is what Get reports for rentals. Empty means still active.
+	rentalState string
+	// rentalPrice is quoted by PriceRental; tests raise it to exercise the cap.
+	rentalPrice float64
+	// createErr makes Create report a purchase that upstream accepted but cannot hand back
+	// yet, e.g. a sale that is still processing.
+	createErr error
 }
 
-func (f *fakeProvider) Services(context.Context) ([]Service, error) {
+func (f *fakeProvider) Services(context.Context, string) ([]Service, error) {
 	return []Service{{Name: "openai", Capability: "sms"}}, nil
 }
-func (f *fakeProvider) Create(ctx context.Context, s, k string) (Verification, error) {
+func (f *fakeProvider) PriceRental(context.Context, string, string) (float64, error) {
+	return f.rentalPrice, nil
+}
+func (f *fakeProvider) Create(ctx context.Context, req PurchaseRequest, k string) (Reservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// Replaying an idempotency key returns the original purchase and buys nothing,
 	// which is what decides whether a retry really gets a new number.
 	if id, ok := f.purchases[k]; ok {
-		return Verification{ID: id}, nil
+		return Reservation{ID: id}, nil
 	}
-	id := "v" + strconv.Itoa(len(f.purchases)+1)
+	prefix := "v"
+	if isRental(req.Type) {
+		prefix = "r"
+	}
+	id := prefix + strconv.Itoa(len(f.purchases)+1)
 	f.purchases[k] = id
-	return Verification{ID: id}, nil
+	if f.createErr != nil {
+		return Reservation{}, f.createErr
+	}
+	return Reservation{ID: id}, nil
 }
-func (f *fakeProvider) Get(context.Context, string) (Verification, []SMS, error) {
-	return Verification{ID: "v1", Number: "15555550100", State: "verificationPending"}, f.sms, nil
+func (f *fakeProvider) Get(_ context.Context, reservationType, id string) (Reservation, []SMS, error) {
+	if isRental(reservationType) {
+		state := f.rentalState
+		if state == "" {
+			state = "nonrenewableActive"
+		}
+		return Reservation{ID: id, Number: "15555550200", State: state, EndsAt: "2099-01-01T00:00:00Z", CreatedAt: fakeRentalCreated}, f.rentalSMS, nil
+	}
+	return Reservation{ID: "v1", Number: "15555550100", State: "verificationPending"}, f.sms, nil
 }
 func fixture(t *testing.T) (*App, *fakeProvider, string) {
 	t.Helper()
@@ -48,7 +78,7 @@ func fixture(t *testing.T) (*App, *fakeProvider, string) {
 	}
 	t.Cleanup(func() { db.Close() })
 	f := &fakeProvider{purchases: map[string]string{}}
-	a := &App{db: db, provider: f, admin: "test-admin", secret: "whsec_test", maxRetries: 1, limitPerMin: 120, keyLimitPerMin: 120, limiter: newLimiter(maxIdentities)}
+	a := &App{db: db, provider: f, admin: "test-admin", secret: "whsec_test", maxRetries: 1, maxRentalPrice: 30, limitPerMin: 120, keyLimitPerMin: 120, limiter: newLimiter(maxIdentities)}
 	key := randomKey("RELAY", "openai")
 	_, e = db.Exec("INSERT INTO keys(hash,hint,service) VALUES(?,?,?)", digest(key), "hint", "openai")
 	if e != nil {
@@ -183,11 +213,11 @@ func TestProviderContract(t *testing.T) {
 	}))
 	defer s.Close()
 	p := &TV{Base: s.URL, Key: "key", Client: s.Client(), MaxPrice: 5}
-	v, e := p.Create(context.Background(), "openai", "stable")
+	v, e := p.Create(context.Background(), PurchaseRequest{Service: "openai", Type: TypeVerification}, "stable")
 	if e != nil {
 		t.Fatal(e)
 	}
-	_, sms, e := p.Get(context.Background(), v.ID)
+	_, sms, e := p.Get(context.Background(), TypeVerification, v.ID)
 	if e != nil || len(sms) != 1 || auth != 1 || purchases != 1 {
 		t.Fatalf("contract failure %v", e)
 	}

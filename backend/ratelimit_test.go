@@ -28,7 +28,7 @@ func TestRateLimitIsPerCDKey(t *testing.T) {
 	keys := make([]string, 20)
 	for i := range keys {
 		keys[i] = randomKey("RELAY", "openai")
-		if _, e := a.db.Exec("INSERT INTO keys(hash,hint,service,state,verification_id) VALUES(?,?,?,?,?)",
+		if _, e := a.db.Exec("INSERT INTO keys(hash,hint,service,state,reservation_id) VALUES(?,?,?,?,?)",
 			digest(keys[i]), "hint", "openai", "waiting", fmt.Sprintf("v%d", i)); e != nil {
 			t.Fatal(e)
 		}
@@ -58,7 +58,7 @@ func TestRateLimitPerCDKeyBudget(t *testing.T) {
 	}
 	// 别的密钥不受影响：额度是按 CD Key 隔离的
 	other := randomKey("RELAY", "openai")
-	a.db.Exec("INSERT INTO keys(hash,hint,service,state,verification_id) VALUES(?,?,?,?,?)", digest(other), "hint", "openai", "waiting", "v")
+	a.db.Exec("INSERT INTO keys(hash,hint,service,state,reservation_id) VALUES(?,?,?,?,?)", digest(other), "hint", "openai", "waiting", "v")
 	if w := post(handler, "/api/status", `{"key":"`+other+`"}`, "1.2.3.4"); w.Code != 200 {
 		t.Fatalf("另一枚密钥不应被牵连：%d %s", w.Code, w.Body.String())
 	}

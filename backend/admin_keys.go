@@ -15,6 +15,7 @@ type keyStats struct {
 	Ready   int `json:"ready"`
 	Waiting int `json:"waiting"`
 	Used    int `json:"used"`
+	Active  int `json:"active"`
 }
 
 func (a *App) listKeys(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +39,8 @@ func (a *App) listKeys(w http.ResponseWriter, r *http.Request) {
 	args := []any{}
 	if state := q.Get("state"); state != "" && state != "all" {
 		switch state {
-		case "ready", "allocating", "waiting", "used", "expired", "timed_out", "canceled", "refunded", "reported", "disabled":
+		case "ready", "allocating", "waiting", "used", "expired", "timed_out", "canceled", "refunded", "reported", "disabled",
+			"rental_active", "rental_expired", "rental_refunded":
 		default:
 			fail(w, 400, "状态无效")
 			return
@@ -63,7 +65,7 @@ func (a *App) listKeys(w http.ResponseWriter, r *http.Request) {
 		page = pages
 	}
 	var stats keyStats
-	if err := a.db.QueryRow("SELECT COUNT(*),COALESCE(SUM(state='ready'),0),COALESCE(SUM(state IN ('waiting','allocating')),0),COALESCE(SUM(state='used'),0) FROM keys").Scan(&stats.Total, &stats.Ready, &stats.Waiting, &stats.Used); err != nil {
+	if err := a.db.QueryRow("SELECT COUNT(*),COALESCE(SUM(state='ready'),0),COALESCE(SUM(state IN ('waiting','allocating')),0),COALESCE(SUM(state='used'),0),COALESCE(SUM(state='rental_active'),0) FROM keys").Scan(&stats.Total, &stats.Ready, &stats.Waiting, &stats.Used, &stats.Active); err != nil {
 		fail(w, 500, "统计读取失败")
 		return
 	}
@@ -77,7 +79,7 @@ func (a *App) listKeys(w http.ResponseWriter, r *http.Request) {
 	items := []adminKey{}
 	for rows.Next() {
 		var k adminKey
-		if err = rows.Scan(&k.ID, &k.Hint, &k.Service, &k.State, &k.VerificationID, &k.Phone, &k.Code, &k.Message, &k.EndsAt, &k.CreatedAt, &k.Retries, &k.FullKey); err != nil {
+		if err = rows.Scan(&k.ID, &k.Hint, &k.Service, &k.ReservationType, &k.Duration, &k.State, &k.ReservationID, &k.Phone, &k.Code, &k.Message, &k.EndsAt, &k.CreatedAt, &k.Retries, &k.FullKey); err != nil {
 			fail(w, 500, "数据库读取失败")
 			return
 		}

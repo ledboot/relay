@@ -26,3 +26,16 @@
 
 /* 接码超时后重新兑换：CD Key 仍然有效，引导用户自己重试 */
 .retry{margin-top:16px}.retry p{margin-bottom:10px}.retry .primary{width:100%}
+
+/* 租用短信列表：最新的排在最上面，新短信插入时直接从顶部出现 */
+.messages{margin:18px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.messages-head{padding:12px 14px;background:var(--bg);border-bottom:1px solid var(--line)}.messages-head small{font-size:11px;color:var(--muted)}
+.messages>p.muted{padding:16px 14px;margin:0;font-size:12px;line-height:1.7}
+.message{padding:14px;border-bottom:1px solid #eff2f0}.message:last-child{border-bottom:0}
+.message-head{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:28px}
+.message-head small{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.message .otp{display:block;color:var(--green);font-size:24px;letter-spacing:3px;font-weight:500;margin:4px 0 6px}
+.message .sms{margin:0}
+/* 接收会话的继续/退出按钮并排，窄屏换行 */
+.actions{display:flex;gap:10px;margin-top:14px}.actions .primary,.actions .secondary{flex:1;justify-content:center}
+@media(max-width:400px){.actions{flex-wrap:wrap}}
