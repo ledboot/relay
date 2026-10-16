@@ -48,9 +48,9 @@ cd ..
 docker compose up -d --build
 ```
 
-服务名与容器名均为 `relay-api` 和 `relay-web`。从旧的 `api` / `web` 改名后，旧容器会变成孤儿并继续占用 `127.0.0.1:3000`，所以要先 `docker compose down --remove-orphans` 再 `up -d --build`；**不要加 `-v`**，否则会一并删除数据卷。卷名有意保持 `sms-data` 不变，改名不影响已有数据；不要顺手改成 `relay-data`，那会新建一个空卷。
+服务名与容器名均为 `relay-api` 和 `relay-web`，数据卷显式命名为 `relay-data`（`compose.yaml` 里用 `name:` 固定，所以改目录名或 Compose 项目名都不会换成新卷）。改名后旧容器会变成孤儿并继续占用 `127.0.0.1:3000`，所以先按旧项目名 `docker compose -p <旧项目名> down --remove-orphans`，再 `up -d --build`；**不要加 `-v`**，否则会一并删除数据卷。旧卷里已有数据时，先拷到新卷再启动：`docker run --rm -v <旧卷>:/from -v relay-data:/to alpine cp -a /from/. /to/`。
 
-前端绑定宿主机 `127.0.0.1:3000`；API 不发布端口，数据库持久化到 `sms-data` 卷。使用已有反向代理提供 HTTPS 并转发到前端。代理请求体限制建议 64 KiB，读取超时至少 60 秒。只有反向代理**覆盖而不是直接信任客户端**的 `X-Forwarded-For` 时才启用 `TRUST_PROXY=true`；否则所有请求共用一个客户端身份。用户接口不受此影响，见下面的限流说明。生产环境不要公开 Go 端口，避免绕过可信代理边界。
+前端绑定宿主机 `127.0.0.1:3000`；API 不发布端口，数据库持久化到 `relay-data` 卷。使用已有反向代理提供 HTTPS 并转发到前端。代理请求体限制建议 64 KiB，读取超时至少 60 秒。只有反向代理**覆盖而不是直接信任客户端**的 `X-Forwarded-For` 时才启用 `TRUST_PROXY=true`；否则所有请求共用一个客户端身份。用户接口不受此影响，见下面的限流说明。生产环境不要公开 Go 端口，避免绕过可信代理边界。
 
 限流分两层。`/api/redeem` 和 `/api/status` 按 **CD Key 哈希**分桶，额度由 `KEY_RATE_LIMIT_PER_MIN` 控制（默认 120）；前端每 6 秒轮询一次约消耗 10，因此每枚密钥有十倍余量，且移动运营商 CGNAT 下共用出口 IP 的客户互不干扰。其余请求（管理接口、读不到密钥的请求、以及超过身份表上限后新出现的身份）按客户端身份分桶，额度由 `RATE_LIMIT_PER_MIN` 控制（默认 120）。身份表上限 50000，超出后新身份并入客户端桶，避免随机密钥撑爆内存。以每分钟 120 次、每次轮询 6 秒计算，旧的全站共享策略只能支持约 12 个同时等待短信的客户，因此不要把用户接口改回按客户端身份限流。修改后重启 API，或 `docker compose up -d --force-recreate`。
 
@@ -86,7 +86,7 @@ bun run build
 
 2026-10-14：已迁移为 Bun 1.3.5，保留原锁定依赖版本。`bun install --frozen-lockfile` 与 `bun run build` 已通过（包括 TypeScript 检查和页面预渲染）。重装修复了早先磁盘不足留下的不完整依赖。Gin 迁移后的 Go 测试此前仍受磁盘不足阻断；Docker 镜像构建、浏览器验收、真实购买及公网回调尚未验证。
 
-2026-10-16：新增接码超时后重新兑换（`MAX_RETRIES`）。`go test -race ./...` 与 `go vet ./...` 已可运行，新增重试用例全部通过；`retries` 列迁移已在开发库副本上验证（35 条历史记录全部默认为 0）。遗留失败 1 例：`TestPurchaseRejection` 断言的错误文案「上游拒绝」在当前源码中不存在（`redeem` 返回的是「号码申请暂未完成，请稍后重新兑换」），属于迁移到 Gin 之前的旧断言，与本次改动无关，待确认后修正。同日还把限流从「全站共享客户端身份」改为「用户接口按 CD Key 分桶」，额度可配置（`KEY_RATE_LIMIT_PER_MIN` / `RATE_LIMIT_PER_MIN`），新增 8 个限流用例；并用变异测试确认回归用例能复现旧策略下「第 13 个客户 429」的行为。同日将 Compose 服务名与容器名改为 `relay-api` / `relay-web`（`API_INTERNAL_URL` 与 `depends_on` 同步，卷名 `sms-data` 有意不改），已用 `docker compose config` 校对、`docker compose build` 构建两个镜像均成功、并在 compose 网络内实测 `relay-web` 按服务名请求 `http://relay-api:8080/api/health` 返回 200。浏览器验收、真实购买及公网回调仍未验证。
+2026-10-16：新增接码超时后重新兑换（`MAX_RETRIES`）。`go test -race ./...` 与 `go vet ./...` 已可运行，新增重试用例全部通过；`retries` 列迁移已在开发库副本上验证（35 条历史记录全部默认为 0）。遗留失败 1 例：`TestPurchaseRejection` 断言的错误文案「上游拒绝」在当前源码中不存在（`redeem` 返回的是「号码申请暂未完成，请稍后重新兑换」），属于迁移到 Gin 之前的旧断言，与本次改动无关，待确认后修正。同日还把限流从「全站共享客户端身份」改为「用户接口按 CD Key 分桶」，额度可配置（`KEY_RATE_LIMIT_PER_MIN` / `RATE_LIMIT_PER_MIN`），新增 8 个限流用例；并用变异测试确认回归用例能复现旧策略下「第 13 个客户 429」的行为。同日将 Compose 服务名与容器名改为 `relay-api` / `relay-web`（`API_INTERNAL_URL` 与 `depends_on` 同步，卷名 `sms-data` 有意不改），已用 `docker compose config` 校对、`docker compose build` 构建两个镜像均成功、并在 compose 网络内实测 `relay-web` 按服务名请求 `http://relay-api:8080/api/health` 返回 200。随后把项目目录、Go module（`module relay`）和前端包名（`relay-web`）统一为 relay，数据卷用 `name:` 固定为 `relay-data`。浏览器验收、真实购买及公网回调仍未验证。
 
 ## CDK 前缀
 

@@ -15,8 +15,9 @@
 data/
 output/keys/
 
-# ── Go 构建与测试产物 ────────────────────────────────────────────────
+# ── Go 构建与测试产物（二进制名 = module 名） ───────────────────────
 backend/server
+backend/relay
 backend/sms-verified
 *.test
 *.out

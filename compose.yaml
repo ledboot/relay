@@ -9,7 +9,7 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-json}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      - sms-data:/data
+      - relay-data:/data
     restart: unless-stopped
   relay-web:
     container_name: relay-web
@@ -25,4 +25,6 @@ services:
       - relay-api
     restart: unless-stopped
 volumes:
-  sms-data:
+  relay-data:
+    # 显式固定卷名：目录名或 Compose 项目名改变时不会换成新卷
+    name: relay-data

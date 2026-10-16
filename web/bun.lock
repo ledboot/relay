@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "sms-verified-web",
+      "name": "relay-web",
       "dependencies": {
         "lucide-react": "^0.468.0",
         "next": "^15.5.9",
