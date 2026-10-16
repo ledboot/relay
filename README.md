@@ -48,7 +48,7 @@ cd ..
 docker compose up -d --build
 ```
 
-服务名与容器名均为 `relay-api` 和 `relay-web`，数据卷显式命名为 `relay-data`（`compose.yaml` 里用 `name:` 固定，所以改目录名或 Compose 项目名都不会换成新卷）。改名后旧容器会变成孤儿并继续占用 `127.0.0.1:3000`，所以先按旧项目名 `docker compose -p <旧项目名> down --remove-orphans`，再 `up -d --build`；**不要加 `-v`**，否则会一并删除数据卷。旧卷里已有数据时，先拷到新卷再启动：`docker run --rm -v <旧卷>:/from -v relay-data:/to alpine cp -a /from/. /to/`。
+服务名与容器名均为 `relay-api` 和 `relay-web`，数据卷显式命名为 `relay-data`（`compose.yaml` 里用 `name:` 固定，所以改目录名或 Compose 项目名都不会换成新卷）。改名后旧容器会变成孤儿并继续占用 `127.0.0.1:3000`，所以先按旧项目名 `docker compose -p <旧项目名> down --remove-orphans`，再 `up -d --build`；**不要加 `-v`**，否则会一并删除数据卷。旧卷里已有数据时，先拷到新卷再启动：`docker volume create relay-data && docker run --rm -v <旧卷>:/from -v relay-data:/to alpine sh -c 'cp -a /from/. /to/ && chown -R 10001:10001 /to'`。**必须改属主**：api 容器以 UID 10001 运行，只 `cp -a` 会留下 root 属主，SQLite 将无法写入 WAL。
 
 前端绑定宿主机 `127.0.0.1:3000`；API 不发布端口，数据库持久化到 `relay-data` 卷。使用已有反向代理提供 HTTPS 并转发到前端。代理请求体限制建议 64 KiB，读取超时至少 60 秒。只有反向代理**覆盖而不是直接信任客户端**的 `X-Forwarded-For` 时才启用 `TRUST_PROXY=true`；否则所有请求共用一个客户端身份。用户接口不受此影响，见下面的限流说明。生产环境不要公开 Go 端口，避免绕过可信代理边界。
 
